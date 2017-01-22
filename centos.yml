@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CentOS 7 with GNOME and VNC
+
+####################
+Parameters:
+  DiskSize:
+    Default: 60
+    Description: The number of GBs on the primary disk
+    Type: Number
+
+  InstanceType:
+    Description: The instance type of each node
+    Default: m4.large
+    Type: String
+
+  KeyName:
+    Description: The SSH key pair
+    Type: AWS::EC2::KeyPair::KeyName
+
+  PublicSubnet:
+    Description: The public subnet to place this node
+    Type: AWS::EC2::Subnet::Id
+
+  StackCreationTimeout:
+    Description: The amount of time to wait for stack creation
+    Default: PT30M
+    Type: String
+
+  VncPassword:
+    Default: centos
+    Description: The VNC password
+    Type: String
+
+  Vpc:
+    Description: The VPC containing the public subnet
+    Type: AWS::EC2::VPC::Id
+
+####################
+Outputs:
+  VncEndpoint:
+    Description: The VNC endpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-VncEndpoint
+    Value: !Sub ${Instance.PublicDnsName}:5901
+
+####################
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+
+  VncSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VNC Security Group
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: 6
+          FromPort: 5901
+          ToPort: 5901
+      VpcId: !Ref Vpc
+
+  Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: !Ref StackCreationTimeout
+    Properties:
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: !Ref DiskSize
+      EbsOptimized: true
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: ami-6d1c2007
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref VncSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #! /bin/bash -x
+
+          # bootstrap
+          cat <<- EOF > /opt/bootstrap.sh
+            #! /bin/bash
+
+            yum -y update
+            yum install -y epel-release
+            yum -y groupinstall "GNOME Desktop"
+            yum install -y pystache python-daemon python34-pip tigervnc-server
+
+            pip3.4 install --upgrade pip awscli
+            wget -O /opt/aws-cfn-bootstrap-latest.amzn1.noarch.rpm https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.amzn1.noarch.rpm
+            rpm -i /opt/aws-cfn-bootstrap-latest.amzn1.noarch.rpm
+            ln -s /usr/local/lib/python2.7/site-packages/cfnbootstrap /usr/lib/python2.7/site-packages/cfnbootstrap
+
+            cp /lib/systemd/system/vncserver@.service /etc/systemd/system/vncserver@:1.service
+            sed -i 's/<USER>/centos/g' /etc/systemd/system/vncserver@:1.service
+            sed -i 's/^\(ExecStart=.*\)"$/\1 -geometry 1920x1080"/' /etc/systemd/system/vncserver@:1.service
+            su - centos -c 'mkdir -p /home/centos/.vnc'
+            su - centos -c 'echo -n ${VncPassword} | vncpasswd -f > /home/centos/.vnc/passwd'
+            chmod 600 /home/centos/.vnc/passwd
+
+            systemctl daemon-reload
+            systemctl enable vncserver@:1
+            systemctl start vncserver@:1
+          EOF
+
+          # execute
+          bash -xe /opt/bootstrap.sh
+
+          # completed
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Instance
